@@ -38,4 +38,51 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_first_name = update.effective_user.first_name
     
     # 2. Tell user to wait
-    status_msg = await update.message.reply_text(f"⏳ Processing
+    status_msg = await update.message.reply_text(f"⏳ Processing link for {user_first_name}...\nPlease wait (this can take 10-30 seconds).")
+
+    # 3. Configure Download Options
+    ydl_opts = {
+        'format': 'bestvideo+bestaudio/best',  # Best Quality
+        'outtmpl': 'downloads/%(id)s.%(ext)s', # Save to 'downloads' folder
+        'noplaylist': True,                    # Single video only
+        'cookiefile': 'cookies.txt',           # (Optional) Helps with some sites, harmless if missing
+    }
+
+    try:
+        # 4. Download
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            video_title = info.get('title', 'Video')
+            # Find the file path
+            filename = f"downloads/{info['id']}.{info['ext']}"
+
+        # 5. Upload to Telegram
+        await update.message.reply_text(f"✅ Download complete!\nSending file...")
+        
+        with open(filename, 'rb') as video_file:
+            await update.message.reply_video(video=video_file, caption=video_title)
+
+        # 6. Delete file to save space
+        if os.path.exists(filename):
+            os.remove(filename)
+        
+        await status_msg.delete()
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}\n(Try a different link or check if the video is private)")
+        print(f"Error: {e}")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Hi! Send me a link from Instagram, YouTube, or Facebook.")
+
+if __name__ == '__main__':
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Commands
+    application.add_handler(CommandHandler('start', start))
+    
+    # Message Handler (Everything that is NOT a command)
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), download_video))
+    
+    print("Bot is starting...")
+    application.run_polling()
