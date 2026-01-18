@@ -7,7 +7,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 import yt_dlp
 
-# --- PART 1: KEEP ALIVE SERVER ---
+# --- PART 1: FAKE WEBSITE (To keep Render awake) ---
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -29,87 +29,93 @@ logging.basicConfig(
 
 BOT_TOKEN = "8503783055:AAGM5zPrqwMTnuPUwY4FStJtge0WDdB8N0I"
 
-# GLOBAL LOCK: This ensures only 1 download happens at a time (prevents crashing)
+# GLOBAL LOCK: Queue system to prevent crashes
 download_lock = asyncio.Lock()
 
 async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
     user_first_name = update.effective_user.first_name
     
-    # 1. Check if bot is busy
     if download_lock.locked():
-        await update.message.reply_text(f"⚠️ Server busy! Added your link to the queue, {user_first_name}...\nPlease wait.")
+        await update.message.reply_text(f"⚠️ Added to queue, {user_first_name}...\nPlease wait.")
 
-    # 2. Wait for the lock (Queue System)
     async with download_lock:
-        status_msg = await update.message.reply_text(f"⏳ Downloading for {user_first_name}...")
+        status_msg = await update.message.reply_text(f"⏳ Analyzing link for {user_first_name}...")
 
-        # FORCE MP4 FILENAME (Fixes the .None error)
-        # We assume the ID might be part of the URL, but let yt-dlp handle it.
-        # We just define that the output MUST be id.mp4
+        # NEW SETTINGS: Allow Images and Carousels (Playlists)
         ydl_opts = {
-            'format': 'bestvideo+bestaudio/best',
-            'outtmpl': 'downloads/%(id)s.mp4',    # <--- FORCED .mp4 EXTENSION
-            'noplaylist': True,
-            'writethumbnail': True,
-            'merge_output_format': 'mp4',
-            'postprocessors': [{'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg'}]
+            'format': 'best',             # Get best quality (Video OR Image)
+            'outtmpl': 'downloads/%(id)s.%(ext)s', # Save with correct extension (.jpg, .mp4, etc)
+            'noplaylist': False,          # ALLOW downloading multiple items (Carousels)
+            'writethumbnail': False,      # We don't need separate thumbnails for images
+            'extract_flat': False,
         }
 
         try:
-            # Run the download
-            # We run this in a separate thread so it doesn't block the bot's heartbeat
             loop = asyncio.get_event_loop()
             
+            # 1. Extract Info and Download
             def run_yt_dlp():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    return info
+                    return ydl.extract_info(url, download=True)
 
             info = await loop.run_in_executor(None, run_yt_dlp)
             
-            video_title = info.get('title', 'Video')
-            video_id = info.get('id')
-            
-            # Since we forced 'outtmpl' to end in .mp4, we know exactly where it is
-            video_filename = f"downloads/{video_id}.mp4"
-            thumb_filename = f"downloads/{video_id}.jpg"
+            # 2. Handle Multiple Files (Carousel/Playlist) vs Single File
+            entries = []
+            if 'entries' in info:
+                # It is a Carousel or Playlist
+                entries = info['entries']
+            else:
+                # It is a Single Post
+                entries = [info]
 
-            # 3. Upload
-            await update.message.reply_text(f"✅ Download complete! Uploading...")
-            
-            with open(video_filename, 'rb') as video_file:
-                if os.path.exists(thumb_filename):
-                    with open(thumb_filename, 'rb') as thumb_file:
-                        await update.message.reply_video(
-                            video=video_file,
-                            caption=video_title,
-                            thumbnail=thumb_file,
-                            write_timeout=60,
-                            read_timeout=60
-                        )
+            await status_msg.edit_text(f"✅ Found {len(entries)} file(s). Uploading now...")
+
+            # 3. Loop through all downloaded files and send them
+            for entry in entries:
+                # Some entries might be None if extraction failed for one item
+                if not entry: continue
+
+                file_id = entry.get('id')
+                ext = entry.get('ext')
+                title = entry.get('title', 'Media')
+                
+                # Construct the filename
+                filename = f"downloads/{file_id}.{ext}"
+                
+                # Check if file exists before trying to send
+                if os.path.exists(filename):
+                    with open(filename, 'rb') as f:
+                        # CHECK: Is it an Image or a Video?
+                        if ext in ['jpg', 'jpeg', 'png', 'webp']:
+                            await update.message.reply_photo(photo=f, caption=title[:50], read_timeout=60, write_timeout=60)
+                        else:
+                            await update.message.reply_video(video=f, caption=title[:50], read_timeout=60, write_timeout=60)
+                    
+                    # Delete after sending
+                    os.remove(filename)
                 else:
-                    await update.message.reply_video(
-                        video=video_file,
-                        caption=video_title,
-                        write_timeout=60,
-                        read_timeout=60
-                    )
+                    # Sometimes yt-dlp merges formats and changes extension to .mkv
+                    # This is a fallback to find the file
+                    for possible_ext in ['mp4', 'mkv', 'webm']:
+                        alt_filename = f"downloads/{file_id}.{possible_ext}"
+                        if os.path.exists(alt_filename):
+                            with open(alt_filename, 'rb') as f:
+                                await update.message.reply_video(video=f, caption=title[:50])
+                            os.remove(alt_filename)
+                            break
 
-            # 4. Cleanup
-            if os.path.exists(video_filename): os.remove(video_filename)
-            if os.path.exists(thumb_filename): os.remove(thumb_filename)
             await status_msg.delete()
 
         except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
+            await update.message.reply_text(f"❌ Error: {str(e)}\n(This might be a private post or unsupported format)")
             print(f"Error: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Bot is Ready! Send multiple links, I will queue them.")
+    await update.message.reply_text("👋 Bot Ready! I can now download:\n- Videos\n- Photos\n- Instagram Carousels (Multiple Slides)")
 
 if __name__ == '__main__':
-    # Create the download folder if it doesn't exist
     if not os.path.exists('downloads'):
         os.makedirs('downloads')
 
